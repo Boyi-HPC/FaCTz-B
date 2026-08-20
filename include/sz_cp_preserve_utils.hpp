@@ -21,6 +21,20 @@ inline int eb_exponential_quantize(double& eb, const int base, const double log_
 	return id;
 }
 
+template<typename T>
+[[nodiscard]] constexpr inline int eb_exponential_quantize_2d(
+	T& eb, const int base, const T log_of_base,
+	const T threshold=std::numeric_limits<T>::epsilon())
+{
+	if(eb <= threshold){
+		eb = 0;
+		return 0;
+	}
+	int id = log2(eb / threshold) / log_of_base;
+	eb = pow(base, id) * threshold;
+	return id;
+}
+
 inline int eb_linear_quantize(double& eb, double threshold=1e-5){
 	int id = eb / threshold;
 	eb = id * threshold;
@@ -128,6 +142,14 @@ template<typename T>
 inline void accumulate(const T value, double& positive, double& negative){
 	if(value >= 0) positive += value;
 	else negative += - value;
+}
+
+template<typename T>
+constexpr inline void accumulate_2d(
+	const T volatile value, T& positive, T& negative)
+{
+	if(value >= 0) positive += value;
+	else negative += -value;
 }
 
 template<typename T>
