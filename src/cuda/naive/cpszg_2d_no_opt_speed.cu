@@ -351,7 +351,7 @@ __global__ void derive_eb_offline_v2(const T* __restrict__ dU, const T* __restri
 }
 
 
-// Header: 8+8+8+4+4+4+4+40 = 80 bytes
+// Header: 8+8+8+4+4+4+4+4+40 = 84(align on 88) bytes
 // File layout after header:
 //   [4 HF blobs: eq_U, eq_V, eq_dEb_U, eq_dEb_V]
 //   [ot_idx_U: ot_count_U * 4 bytes]
@@ -439,7 +439,7 @@ struct CpCompressDebugOptions {
     bool deal_with_land_data = true;
     bool deal_with_ebzero = true;
     bool run_cusz_lorenzo = false;
-    bool test_cusz_lorenzo = true;
+    bool test_cusz_lorenzo = false;
     bool run_quantization_lorenzo = true;
     bool run_hf = true;
     bool compute_ratio = true;
@@ -687,9 +687,6 @@ sz_compress_cp_preserve_2d_offline_gpu(const T * U, const T * V,
     dim3 blockSize_v2(BLOCKSIZE_X, BLOCKSIZE_Y, 1);
     dim3 gridSize_v2((r2 + (blockSize_v2.x-2) - 1) / (blockSize_v2.x-2), 
         (r1 + (blockSize_v2.y-2)-1) / (blockSize_v2.y-2));
-    dim3 blockSize_v3(BLOCKSIZE_X, BLOCKSIZE_Y, 1);
-    dim3 gridSize_v3((r2 + (blockSize_v3.x-2) - 1) / (blockSize_v3.x-2), 
-        (r1 + (blockSize_v3.y*NUM_PRE_THREAD-2)-1) / (blockSize_v3.y*NUM_PRE_THREAD-2));
     auto bytes = r1 * r2 * sizeof(T) * 2.0;
     auto GiB = 1024 * 1024 * 1024.0;
     int N = 1;
