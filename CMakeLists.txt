@@ -11,6 +11,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
 
 option(FACTZ_BUILD_CUDA "Build CUDA implementations" ON)
 option(FACTZ_BUILD_CUDA_NAIVE "Build the naive CUDA cpSZ-offline implementation" ON)
+option(FACTZ_BUILD_CUDA_V1 "Build the V1 CUDA cpSZ-offline implementation" ON)
+option(FACTZ_BUILD_CUDA_V1_1 "Build the V1.1 CUDA cpSZ-offline implementation" OFF)
+option(FACTZ_BUILD_CUDA_V1_2 "Build the V1.2 CUDA cpSZ-offline implementation" OFF)
+option(FACTZ_BUILD_CUDA_V1_3 "Build the V1.3 CUDA cpSZ-offline implementation" OFF)
+option(FACTZ_BUILD_CUDA_V1_4 "Build the V1.4 CUDA cpSZ-offline implementation" OFF)
+option(FACTZ_BUILD_CUDA_V1_5 "Build the V1.5 GPU-resident CUDA cpSZ-offline implementation" OFF)
+
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 find_package(zstd REQUIRED)
 find_package(FTK REQUIRED HINTS "${CMAKE_CURRENT_SOURCE_DIR}/external/ftk/install/lib/cmake/FTK")
