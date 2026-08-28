@@ -30,7 +30,7 @@ using namespace std;
 #define BLOCKSIZE_X 32
 #define BLOCKSIZE_Y 8
 #define NUM_PRE_THREAD 4
-#define RADIUS 4096
+#define RADIUS 512
 
 template <typename T>
 struct ReplaceZero
@@ -986,7 +986,7 @@ sz_compress_cp_preserve_2d_offline_gpu(const T *U, const T *V,
                            hf_lens[1], hf_lens[1] * 100.0 / raw_eq,
                            hf_lens[2], hf_lens[2] * 100.0 / raw_deb,
                            hf_lens[3], hf_lens[3] * 100.0 / raw_deb);
-                }
+                } 
                 else if (sizeof(Eq1) == sizeof(uint8_t) && sizeof(Eq2) == sizeof(uint8_t))
                 {
                     run_gpu_huffman_u1_arrays(
@@ -1094,17 +1094,36 @@ sz_compress_cp_preserve_2d_offline_gpu(const T *U, const T *V,
             if (debug_options.compute_ratio)
             {
                 printf("COMPUTE_RATIO\n");
-                size_t sp_U_bytes = (*h_ot_num_U + (uint32_t)zero_eb_U_count) * (sizeof(uint32_t) + sizeof(float));
-                size_t sp_V_bytes = (*h_ot_num_V + (uint32_t)zero_eb_V_count) * (sizeof(uint32_t) + sizeof(float));
-                size_t original = r1 * r2 * sizeof(T);
-                size_t compressed_U = hf_lens[0] + hf_lens[2] + sp_U_bytes;
-                size_t compressed_V = hf_lens[1] + hf_lens[3] + sp_V_bytes;
+                const size_t sp_U_bytes =
+                    (static_cast<size_t>(*h_ot_num_U) + static_cast<size_t>(zero_eb_U_count)) *
+                    (sizeof(uint32_t) + sizeof(float));
+                const size_t sp_V_bytes =
+                    (static_cast<size_t>(*h_ot_num_V) + static_cast<size_t>(zero_eb_V_count)) *
+                    (sizeof(uint32_t) + sizeof(float));
+
+                // Per-field payload sizes. Shared file overhead (header and land
+                // bitpack) is intentionally excluded because it belongs to both fields.
+                const size_t original_per_field = r1 * r2 * sizeof(T);
+                const size_t compressed_U = hf_lens[0] + hf_lens[2] + sp_U_bytes;
+                const size_t compressed_V = hf_lens[1] + hf_lens[3] + sp_V_bytes;
+
+                // Exact byte count written by write_cucpsz().
+                const size_t original_total = original_per_field * 2;
+                const size_t compressed_total =
+                    sizeof(CucpszHeader) +
+                    hf_lens[0] + hf_lens[1] + hf_lens[2] + hf_lens[3] +
+                    land_bitpack_bytes + sp_U_bytes + sp_V_bytes;
+
                 printf("  outlier_U=%u  zeroeb_U=%d  outlier_V=%u  zeroeb_V=%d\n",
                        *h_ot_num_U, zero_eb_U_count, *h_ot_num_V, zero_eb_V_count);
-                printf("U compression ratio: %f\n", (double)original / compressed_U);
-                printf("V compression ratio: %f\n", (double)original / compressed_V);
-                printf("Overall compression ratio: %f\n",
-                       (double)(original * 2) / (compressed_U + compressed_V));
+                printf("  header=%zu  land_bitpack=%zu  compressed_total=%zu bytes\n",
+                       sizeof(CucpszHeader), land_bitpack_bytes, compressed_total);
+                printf("U payload compression ratio: %.6f\n",
+                       compressed_U ? static_cast<double>(original_per_field) / compressed_U : 0.0);
+                printf("V payload compression ratio: %.6f\n",
+                       compressed_V ? static_cast<double>(original_per_field) / compressed_V : 0.0);
+                printf("Overall file compression ratio: %.6f\n",
+                       compressed_total ? static_cast<double>(original_total) / compressed_total : 0.0);
                 printf("\n");
             }
 
