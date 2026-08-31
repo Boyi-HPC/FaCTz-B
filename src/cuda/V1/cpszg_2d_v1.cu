@@ -320,7 +320,6 @@ __global__ void derive_eb_offline_v2(const T* __restrict__ dU, const T* __restri
     }
     __syncthreads();
 
-
     if(row<r1-2 && col<r2-2 && localRow<TileDim_Y-2 && localCol<TileDim_X-2)
     {
         T threshold = (T)(1.0 / (1 << 20));
@@ -339,6 +338,7 @@ __global__ void derive_eb_offline_v2(const T* __restrict__ dU, const T* __restri
         eq_dEb_U[(row+1) * r2 + (col+1)] = id;
 
         temp = buf_eb[localRow][localCol] * fabs(buf_V[localRow+1][localCol+1]);
+
         if(temp <= threshold){
             temp = 0;
             id = 0;
@@ -350,12 +350,6 @@ __global__ void derive_eb_offline_v2(const T* __restrict__ dU, const T* __restri
 
         dEb_V[(row+1) * r2 + (col+1)] =  temp;
         eq_dEb_V[(row+1) * r2 + (col+1)] = id;
-        
-        // if((row+1)*r2 + (col+1) == 24509){
-        //     printf("dEB_U:%f, eq_dEb_U:%d, dEB_V:%f, eq_dEb_V:%d\n", 
-        //         dEb_U[(row+1) * r2 + (col+1)], eq_dEb_U[(row+1) * r2 + (col+1)], 
-        //         dEb_V[(row+1) * r2 + (col+1)], eq_dEb_V[(row+1) * r2 + (col+1)]);
-        // }
     }
     __syncthreads();
 
@@ -366,128 +360,6 @@ __global__ void derive_eb_offline_v2(const T* __restrict__ dU, const T* __restri
         eq_dEb_V[row * r2 + col] = 0;
     }
     __syncthreads();
-}
-
-//version 3, single thread muti-compute 32*32 data map to 32*8
-template <typename T, typename Eq2 = uint16_t, int TileDim_X = BLOCKSIZE_X, int TileDim_Y = BLOCKSIZE_Y>
-__global__ void derive_eb_offline_v3(const T* __restrict__ dU, const T* __restrict__ dV, T* __restrict__ dEb, T* __restrict__  dEb_U,  T* __restrict__ dEb_V, 
-        Eq2* __restrict eq_dEb_U, Eq2* __restrict eq_dEb_V, int r1, int r2, T max_pwr_eb){
-    constexpr auto YSEQ = TileDim_X / TileDim_Y;
-    __shared__ T buf_U[TileDim_Y * YSEQ][TileDim_X+1];
-    __shared__ T buf_V[TileDim_Y * YSEQ][TileDim_X+1];
-    __shared__ T per_cell_eb_L[TileDim_Y * YSEQ][TileDim_X+1];
-    __shared__ T per_cell_eb_U[TileDim_Y * YSEQ][TileDim_X+1];  
-    __shared__ T buf_eb[TileDim_Y * YSEQ][TileDim_X+1]; 
-    //int row = blockIdx.y * (YSEQ * blockDim.y - 2) + threadIdx.y * YSEQ; // global row index
-    //int col = blockIdx.x * (blockDim.x-2) + threadIdx.x; // global col index
-#define row (blockIdx.y * (YSEQ * blockDim.y - 2) + threadIdx.y * YSEQ + i)
-#define col blockIdx.x * (blockDim.x-2) + threadIdx.x
-    //int localRow = threadIdx.y; // local row index
-    //int localCol = threadIdx.x; // local col index
-#define localRow (threadIdx.y*YSEQ + i)
-#define localCol threadIdx.x
-
-    for (int i = 0; i < YSEQ; i++)
-    {
-        buf_eb[localRow][localCol] = max_pwr_eb;
-    }
-    __syncthreads();
-
-    // load data from global memory to shared memory
-    for (int i = 0; i < YSEQ; i++)
-        {
-        if(row < r1 && col < r2){
-            buf_U[localRow][localCol] = dU[row * r2 + col];
-            buf_V[localRow][localCol] = dV[row * r2 + col];
-        }
-    }
-    __syncthreads();
-
-    for (int i = 0; i < YSEQ; i++)
-    {
-        if(localRow<YSEQ*TileDim_Y-1 && localCol<TileDim_X-1){
-            per_cell_eb_U[localRow][localCol] = gpu_max_eb_to_keep_position_and_type(buf_U[localRow][localCol], buf_U[localRow][localCol+1], buf_U[localRow+1][localCol+1],
-                buf_V[localRow][localCol], buf_V[localRow][localCol+1], buf_V[localRow+1][localCol+1]);
-            per_cell_eb_L[localRow][localCol] = gpu_max_eb_to_keep_position_and_type(buf_U[localRow][localCol], buf_U[localRow+1][localCol], buf_U[localRow+1][localCol+1],
-                buf_V[localRow][localCol], buf_V[localRow+1][localCol], buf_V[localRow+1][localCol+1]);
-        }
-        
-    }
-    __syncthreads();
-
-    T localmin;
-    for (int i = 0; i < YSEQ; i++)
-    {
-        if(localRow<YSEQ*TileDim_Y-2 && localCol<TileDim_X-2)
-        {
-            localmin = buf_eb[localRow][localCol];
-            auto temp = per_cell_eb_U[localRow][localCol];
-            localmin = min(localmin, temp);
-            temp =  per_cell_eb_L[localRow][localCol];
-            localmin = min(localmin, temp);
-            temp =  per_cell_eb_U[localRow+1][localCol];
-            localmin = min(localmin, temp);
-            temp = per_cell_eb_L[localRow][localCol+1];
-            localmin = min(localmin, temp);
-            temp = per_cell_eb_U[localRow+1][localCol+1];
-            localmin = min(localmin, temp);
-            temp = per_cell_eb_L[localRow+1][localCol+1];
-            localmin = min(localmin, temp);
-            buf_eb[localRow][localCol] = localmin;
-        }
-    }
-    __syncthreads();
-
-    for (int i = 0; i < YSEQ; i++)
-    {
-        if(row<r1-2 && col<r2-2 && localRow<YSEQ*TileDim_Y-2 && localCol<TileDim_X-2)
-        {
-            T threshold = (T)(1.0 / (1 << 20));
-            int id;
-            auto temp = buf_eb[localRow][localCol] * fabs(buf_U[localRow+1][localCol+1]);
-            if(temp <= threshold){
-                temp = 0;
-                id = 0;
-            }
-            if(temp > threshold){
-                id = log2(temp / threshold)/2.0;
-                temp = (T)(1ULL << (2 * id)) * threshold;
-            }
-
-            dEb_U[(row+1) * r2 + (col+1)] = temp;
-            eq_dEb_U[(row+1) * r2 + (col+1)] = id;
-
-            temp = buf_eb[localRow][localCol] * fabs(buf_V[localRow+1][localCol+1]);
-            if(temp <= threshold){
-                temp = 0;
-                id = 0;
-            }
-            if(temp > threshold){
-                id = log2(temp / threshold)/2.0;
-                temp = (T)(1ULL << (2 * id)) * threshold;
-            }
-
-            dEb_V[(row+1) * r2 + (col+1)] =  temp;
-            eq_dEb_V[(row+1) * r2 + (col+1)] = id;
-            
-            // if((row+1)*r2 + (col+1) == 24509){
-            //     printf("dEB_U:%f, eq_dEb_U:%d, dEB_V:%f, eq_dEb_V:%d\n", 
-            //         dEb_U[(row+1) * r2 + (col+1)], eq_dEb_U[(row+1) * r2 + (col+1)], 
-            //         dEb_V[(row+1) * r2 + (col+1)], eq_dEb_V[(row+1) * r2 + (col+1)]);
-            // }
-        }
-    }
-    __syncthreads();
-
-    for (int i = 0; i < YSEQ; i++)
-    {
-        if((row == 0 || col ==0 || row==r1-1 || col == r2-1)&&(row<r1-1 && col<r2-1)){
-            dEb_U[row * r2 + col] = 0;
-            dEb_V[row * r2 + col] = 0;
-            eq_dEb_U[row * r2 + col] = 0;
-            eq_dEb_V[row * r2 + col] = 0;
-        }
-    }
 }
 
 template <typename Eq2>
