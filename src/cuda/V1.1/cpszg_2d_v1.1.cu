@@ -941,7 +941,6 @@ sz_compress_cp_preserve_2d_offline_gpu(const T * U, const T * V,
         cudaEventRecord(_ce1);
         cudaEventSynchronize(_ce1);
         cudaEventElapsedTime(&ms_derive_eb, _ce0, _ce1);
-        printf("compute V3 eb_gpu done\n");
         printf("\n");
         
         if(debug_options.verify_derive_eb){
