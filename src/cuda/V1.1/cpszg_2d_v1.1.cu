@@ -33,7 +33,7 @@ using namespace std;
 #define BLOCKSIZE_X 32 //default32
 #define BLOCKSIZE_Y 16 //default16
 #define NUM_PRE_THREAD 4
-#define RADIUS 4096
+#define RADIUS 512
 
 template<typename T>
 struct ReplaceZero {
