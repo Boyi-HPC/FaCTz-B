@@ -49,31 +49,20 @@ V[i] = 垂直方向分量
 3. `lorenzo`
 4. `huffman`
 
-主数据流和三条旁路数据流如下：
-
-```text
-                     ┌─ land bitpack ───────────────────────────────┐
-U, V ── derive_eb ── exception process ── Lorenzo ── Huffman ── .cucpsz
-          │                 │                 │          │
-          │                 └─ zero-EB 原值/下标 ────────┤
-          └─ dEb_U/V、eq_dEb_U/V                        │
-                                            └─ outlier 原值/下标 ───┘
-```
-
 这里有两类容易混淆的 ID：
 
 | 数组                       | 含义                                   | 产生阶段      |
 | -------------------------- | -------------------------------------- | ------------- |
-| `eq_dEb_U`, `eq_dEb_V` | EB 的指数 ID，用来重建每个元素的误差界 | `derive_eb` |
-| `eq_U`, `eq_V`         | 数据经过 Lorenzo 预测和量化后的量化码  | `lorenzo`   |
+| `eq_dEb_U`, `eq_dEb_V` | 量化后的error bound                    | `derive_eb` |
+| `eq_U`, `eq_V`         | 数据经过 Lorenzo 预测和量化后的数据U,V | `lorenzo`   |
 
 另外有三类不进入普通量化码的数据：
 
-| 旁路数据             | 保存内容                                          | 解压时机                     |
-| -------------------- | ------------------------------------------------- | ---------------------------- |
-| land bitpack         | `U[i] == 0 && V[i] == 0` 的位置，每个元素 1 bit | 最后把 U、V 都恢复成精确的 0 |
-| zero-EB 列表         | EB ID 为 0 的元素下标和原始浮点值                 | Lorenzo 解压后覆盖           |
-| Lorenzo outlier 列表 | 无法在量化半径内表示的元素下标和原始浮点值        | Lorenzo 解压前放入预测缓冲区 |
+| 旁路数据             | 保存内容                                                                       | 解压时机                         |
+| -------------------- | ------------------------------------------------------------------------------ | -------------------------------- |
+| land bitpack         | `U[i] == 0 && V[i] == 0` 的位置，每个元素 1 bit，实际上是occean data里的陆地 | 最后把 U、V 都恢复成精确的 0     |
+| zero-EB 列表         | 无法被量化的error bound(error bound为0或者error bound <$|threshold|$)        | lossless保存后Lorenzo解压后覆盖  |
+| Lorenzo outlier 列表 | 无法在后续huffman encode半径内表示的元素下标和原始浮点值                       | Lorenzo 解压前放入outlier buffer |
 
 ## 1. derive_eb
 
@@ -114,13 +103,91 @@ __syncthreads();
 根据三个顶点的 `(U,V)` 计算仍能保持拓扑位置和类型的最大相对 EB：
 
 ```cpp
-per_cell_eb_U[localRow][localCol] =
-    gpu_max_eb_to_keep_position_and_type(
-        U00, U01, U11, V00, V01, V11);
+per_cell_eb_U[localRow][localCol] = gpu_max_eb_to_keep_position_and_type(U00, U01, U11, V00, V01, V11);
 
-per_cell_eb_L[localRow][localCol] =
-    gpu_max_eb_to_keep_position_and_type(
-        U00, U10, U11, V00, V10, V11);
+per_cell_eb_L[localRow][localCol] = gpu_max_eb_to_keep_position_and_type(U00, U10, U11, V00, V10, V11);
+```
+
+gpu_max_eb_to_keep_position_and_type计算原理在论文：https://ieeexplore.ieee.org/document/9920175
+具体内容如下：
+
+```cpp
+template <typename T>
+[[nodiscard]] constexpr inline double gpu_max_eb_to_keep_position_and_type(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2)
+{
+    auto gpu_minf = [](auto a, auto b) -> T
+    { return (a < b) ? a : b; };
+#define U0V1 u0 *v1
+#define U1V0 u1 *v0
+#define U0V2 u0 *v2
+#define U2V0 u2 *v0
+#define U1V2 u1 *v2
+#define U2V1 u2 *v1
+    T det = U0V1 - U1V0 + U1V2 - U2V1 + U2V0 - U0V2;
+    T eb = 0;
+    if (det != 0)
+    {
+        T d1 = U2V0 - U0V2;
+        T d2 = U1V2 - U2V1;
+        T d3 = U0V1 - U1V0;
+        bool f1 = (det / d1 >= T(1));// u0v1 - u1v0 + u1v2 - u2v1>=0
+        bool f2 = (det / d2 >= T(1));// u0v1 - u1v0 + u2v0 - u0v2>=0
+        bool f3 = (det / d3 >= T(1));// u1v2 - u2v1 + u2v0 - u0v2>=0
+        if (!f1)
+        {
+            T pos1 = (U2V0 >= 0 ? U2V0 : 0) + ((-U0V2) >= 0 ? (-U0V2) : 0);
+            T neg1 = (U2V0 < 0 ? -U2V0 : 0) + ((-U0V2) < 0 ? U0V2 : 0);
+            T P1 = sqrt(pos1);
+            T N1 = sqrt(neg1);
+            T res1 = fabs(P1 - N1) / (P1 + N1);
+
+            T pos2 = (U0V1 >= 0 ? U0V1 : 0) + ((-U1V0) >= 0 ? (-U1V0) : 0) + (U1V2 >= 0 ? U1V2 : 0) + ((-U2V1) >= 0 ? (-U2V1) : 0);
+            T neg2 = (U0V1 < 0 ? -U0V1 : 0) + ((-U1V0) < 0 ? U1V0 : 0) + (U1V2 < 0 ? -U1V2 : 0) + ((-U2V1) < 0 ? U2V1 : 0);
+            T P2 = sqrt(pos2);
+            T N2 = sqrt(neg2);
+            T res2 = fabs(P2 - N2) / (P2 + N2);
+            T eb_cur = gpu_minf(res1, res2);
+
+            eb = MAX(eb, eb_cur);
+        }
+        if (!f2)
+        {
+            T pos1 = (U1V2 >= 0 ? U1V2 : 0) + ((-U2V1) >= 0 ? (-U2V1) : 0);
+            T neg1 = (U1V2 < 0 ? -U1V2 : 0) + ((-U2V1) < 0 ? U2V1 : 0);
+            T P1 = sqrt(pos1);
+            T N1 = sqrt(neg1);
+            T res1 = fabs(P1 - N1) / (P1 + N1);
+
+            T pos2 = (U0V1 >= 0 ? U0V1 : 0) + ((-U1V0) >= 0 ? (-U1V0) : 0) + (U2V0 >= 0 ? U2V0 : 0) + ((-U0V2) >= 0 ? (-U0V2) : 0);
+            T neg2 = (U0V1 < 0 ? -U0V1 : 0) + ((-U1V0) < 0 ? U1V0 : 0) + (U2V0 < 0 ? -U2V0 : 0) + ((-U0V2) < 0 ? U0V2 : 0);
+            T P2 = sqrt(pos2);
+            T N2 = sqrt(neg2);
+            T res2 = fabs(P2 - N2) / (P2 + N2);
+            T eb_cur = gpu_minf(res1, res2);
+
+            eb = MAX(eb, eb_cur);
+        }
+        if (!f3)
+        {
+            T pos1 = (U0V1 >= 0 ? U0V1 : 0) + ((-U1V0) >= 0 ? (-U1V0) : 0);
+            T neg1 = (U0V1 < 0 ? -U0V1 : 0) + ((-U1V0) < 0 ? U1V0 : 0);
+            T P1 = sqrt(pos1);
+            T N1 = sqrt(neg1);
+            T res1 = fabs(P1 - N1) / (P1 + N1);
+
+            T pos2 = (U1V2 >= 0 ? U1V2 : 0) + ((-U2V1) >= 0 ? (-U2V1) : 0) + (U2V0 >= 0 ? U2V0 : 0) + ((-U0V2) >= 0 ? (-U0V2) : 0);
+            T neg2 = (U1V2 < 0 ? -U1V2 : 0) + ((-U2V1) < 0 ? U2V1 : 0) + (U2V0 < 0 ? -U2V0 : 0) + ((-U0V2) < 0 ? U0V2 : 0);
+            T P2 = sqrt(pos2);
+            T N2 = sqrt(neg2);
+            T res2 = fabs(P2 - N2) / (P2 + N2);
+            T eb_cur = gpu_minf(res1, res2);
+
+            eb = MAX(eb, eb_cur);
+        }
+        eb = gpu_minf(eb, 1);
+    }
+    return eb;
+}
 ```
 
 一个顶点会影响周围多个三角形，因此代码取与该顶点相关的 6 个三角形
@@ -136,8 +203,7 @@ localmin = min(localmin, per_cell_eb_U[localRow + 1][localCol + 1]);
 localmin = min(localmin, per_cell_eb_L[localRow + 1][localCol + 1]);
 ```
 
-随后把相对 EB 分别乘以 `|U[i]|` 和 `|V[i]|`，得到两个分量各自的绝对
-EB。绝对 EB 再向下量化到 `threshold × 4^id`：
+随后把相对 error bound 分别乘以 `|U[i]|` 和 `|V[i]|`，得到两个分量各自的绝对error bound。绝对 error bound 再向下量化到 `threshold × 4^id`：
 
 ```cpp
 T threshold = (T)(1.0 / (1 << 20));
@@ -163,20 +229,12 @@ id = floor(log2(raw_eb / threshold) / 2)
 stored_eb = 2^(2*id) * threshold = 4^id * threshold
 ```
 
-例如 `threshold = 2^-20`，若 `raw_eb = 0.01`，则 `id = 6`，实际使用的
-EB 是 `2^12 × 2^-20 = 2^-8 = 0.00390625`。它不大于原始允许值，因此不会
-放宽拓扑约束。
+例如 `threshold = 2^-20`，若 `raw_eb = 0.01`，则 `id = 6`，实际使用的EB 是 `2^12 × 2^-20 = 2^-8 = 0.00390625`。它不大于原始允许值，因此不会放宽拓扑约束。
 
 ### 输出
 
-- `dEb_U[i]`, `dEb_V[i]`：Lorenzo 直接使用的逐元素浮点 EB。
-- `eq_dEb_U[i]`, `eq_dEb_V[i]`：对应的逐元素 EB 指数 ID；主函数中
-  `eq_dEb_U` 的变量名是 `eq_dEb`。
-- `id == 0` 表示该位置的 EB 太小，必须进入后面的 `eb_zero` 异常流程。
-
-当前 kernel 签名中的 `dEb`（调用处为 `eb_gpu`）没有在 kernel 内写入；真正
-参与后续处理的是上面四个 U/V 数组。边界写零的条件也只实际覆盖首行或首列，
-详见[边界分支](./cpszg_2d_no_opt_speed.cu#L371)。
+- `dEb_U[i]`, `dEb_V[i]`：解压后的error bound。
+- `eq_dEb_U[i]`, `eq_dEb_V[i]`：量化后的error bound
 
 ### Naive 性能特征
 
@@ -185,14 +243,11 @@ EB 是 `2^12 × 2^-20 = 2^-8 = 0.00390625`。它不大于原始允许值，因�
 
 ## 2. exception process
 
-异常处理位于 `derive_eb` 和 Lorenzo 之间。它先处理陆地位置，再处理零 EB
-位置。两者用途不同：land bitpack 同时描述 U/V 都为零的位置；zero-EB
-列表分别描述 U 或 V 无法使用普通 EB 量化的位置。
+异常处理位于 `derive_eb` 和 Lorenzo 之间。它先处理陆地位置，再处理error bound为位置。两者用途不同：land bitpack 同时描述 U/V 都为零(occean data为陆地位置)的位置；zero-EB列表分别描述 U 或 V 无法使用普通error bound量化的位置。
 
 ### 2.1 land_data
 
-实现位置：[`land bitpack 构建`](./cpszg_2d_no_opt_speed.cu#L798) 和
-[`DEAL_WITH_LAND_DATA`](./cpszg_2d_no_opt_speed.cu#L829)。
+实现位置：[`land bitpack 构建`](./cpszg_2d_no_opt_speed.cu#L798) 和[`DEAL_WITH_LAND_DATA`](./cpszg_2d_no_opt_speed.cu#L829)。
 
 #### 输入
 
@@ -213,12 +268,9 @@ for (size_t i = 0; i < num_elements; i++) {
 }
 ```
 
-`i / 8` 选择字节，`i % 8` 选择该字节中的 bit。例如 `i = 13` 时使用第 1
-个字节的第 5 bit，对应掩码 `0010 0000`，即 `0x20`。bitpack 只需要
-`ceil(n/8)` 字节。
+`i / 8` 选择字节，`i % 8` 选择该字节中的 bit。例如 `i = 13` 时使用第 1个字节的第 5 bit，对应掩码 `0010 0000`，即 `0x20`。bitpack 只需要`ceil(n/8)` 字节。
 
-然后 Thrust 对全部元素做一次扫描。对于陆地位置，把 U、V 的 EB 都替换为
-由 `max_pwr_eb` 离散化得到的最大 EB：
+然后 Thrust 对全部元素做一次扫描。对于陆地位置，把 U、V 的 EB 都替换为由 `max_pwr_eb` 离散化得到的最大 EB：
 
 ```cpp
 thrust::for_each(idx_first, idx_last, [=] __device__(size_t i) {
@@ -232,8 +284,7 @@ thrust::for_each(idx_first, idx_last, [=] __device__(size_t i) {
 });
 ```
 
-这些位置的精确答案已知为 `(0,0)`，所以主量化路径可以使用较宽松的 EB；
-解压最后再根据 bitpack 把 U、V 强制恢复为精确的 0。
+这些位置的精确答案已知为 `(0,0)`，所以主量化路径可以使用较宽松的 EB；解压最后再根据 bitpack 把 U、V 强制恢复为精确的 0。
 
 #### 输出
 
@@ -242,8 +293,7 @@ thrust::for_each(idx_first, idx_last, [=] __device__(size_t i) {
 
 #### Naive 性能特征
 
-bitpack 先在 CPU 构造，再复制到 GPU；异常处理又对 `dU/dV` 做一次完整的
-Thrust 扫描。写文件前 bitpack 还会从 GPU 复制回 CPU。
+bitpack 先在 CPU 构造，再复制到 GPU；异常处理又对 `dU/dV` 做一次完整的Thrust 扫描。写文件前 bitpack 还会从 GPU 复制回 CPU。
 
 ### 2.2 eb_zero
 
@@ -251,10 +301,7 @@ Thrust 扫描。写文件前 bitpack 还会从 GPU 复制回 CPU。
 
 #### 为什么要单独保存
 
-`derive_eb` 产生 `eq_dEb_component[i] == 0`，表示该位置允许的 EB 小到无法用
-普通量化路径安全表示。Naive 版本先保存该位置的原始值和下标，再临时把它的
-EB 改成最大 EB，让统一的 Lorenzo kernel 能继续运行。解压时再用保存的原始值
-覆盖 Lorenzo 结果，从而保持这些位置精确。
+`derive_eb` 产生 `eq_dEb_component[i] == 0`，表示该位置允许的 EB 小到无法用普通量化路径安全表示。Naive 版本先保存该位置的原始值和下标，再临时把它的EB 改成最大 EB，让统一的 Lorenzo kernel 能继续运行。解压时再用保存的原始值覆盖 Lorenzo 结果，从而保持这些位置精确。
 
 例如：
 
@@ -269,72 +316,48 @@ zero_U_count   = 2
 
 #### 输入
 
-- `dU`, `dV`：需要保留异常原值的数据。
-- `eq_dEb_U/V`：作为 `copy_if` 的筛选 stencil。
-- `dEb_U/V`：之后要替换的小 EB。
+- `dU`, `dV`：U,V具体数据。
+- `eq_dEb_U/V`：量化后的U,V对应error bound。
+- `dEb_U/V`：解压后的U,V对应error bound。
 
 #### 处理过程
 
 先生成所有线性下标，再分别 compact U/V 的原始值和下标：
 
 ```cpp
-thrust::sequence(thrust::device,
-                 data_indices, data_indices + r1 * r2);
+thrust::sequence(thrust::device, data_indices, data_indices + r1 * r2);
 
-end_it = thrust::copy_if(thrust::device,
-    dU, dU + r1 * r2, eq_dEb,
-    ebIsZero_U_data, IsZero<T>());
-thrust::copy_if(thrust::device,
-    data_indices, data_indices + r1 * r2, eq_dEb,
-    ebIsZero_U_indices, IsZero<T>());
+end_it = thrust::copy_if(thrust::device, dU, dU + r1 * r2, eq_dEb, ebIsZero_U_data, IsZero<T>());
+thrust::copy_if(thrust::device, data_indices, data_indices + r1 * r2, eq_dEb, ebIsZero_U_indices, IsZero<T>());
 zero_eb_U_count = end_it - ebIsZero_U_data;
 
-end_it = thrust::copy_if(thrust::device,
-    dV, dV + r1 * r2, eq_dEb_V,
-    ebisZero_V_data, IsZero<T>());
-thrust::copy_if(thrust::device,
-    data_indices, data_indices + r1 * r2, eq_dEb_V,
-    ebIsZero_V_indices, IsZero<T>());
+end_it = thrust::copy_if(thrust::device, dV, dV + r1 * r2, eq_dEb_V, ebisZero_V_data, IsZero<T>());
+thrust::copy_if(thrust::device, data_indices, data_indices + r1 * r2, eq_dEb_V, ebIsZero_V_indices, IsZero<T>());
 zero_eb_V_count = end_it - ebisZero_V_data;
 ```
 
-值和下标使用同一个 stencil，`copy_if` 保持相同顺序，所以第 `k` 个 value
-与第 `k` 个 index 对应。之后替换浮点 EB 和 EB ID：
+值和下标使用同一个 stencil，`copy_if` 保持相同顺序，所以第 `k` 个 value与第 `k` 个 index 对应。之后替换浮点 EB 和 量化EB：
 
 ```cpp
 int id = log2(max_pwr_eb / threshold) / 2.0;
 T eb_back = (T)(1ULL << (2 * id)) * threshold;
 
-thrust::transform(thrust::device,
-    dEb_U, dEb_U + n, dEb_U,
-    ReplaceLessThreshold(eb_back, threshold));
-thrust::transform(thrust::device,
-    dEb_V, dEb_V + n, dEb_V,
-    ReplaceLessThreshold(eb_back, threshold));
-thrust::transform(thrust::device,
-    eq_dEb_U, eq_dEb_U + n, eq_dEb_U,
-    ReplaceZero(id));
-thrust::transform(thrust::device,
-    eq_dEb_V, eq_dEb_V + n, eq_dEb_V,
-    ReplaceZero(id));
+thrust::transform(thrust::device, dEb_U, dEb_U + n, dEb_U, ReplaceLessThreshold(eb_back, threshold));
+thrust::transform(thrust::device, dEb_V, dEb_V + n, dEb_V, ReplaceLessThreshold(eb_back, threshold));
+thrust::transform(thrust::device, eq_dEb_U, eq_dEb_U + n, eq_dEb_U, ReplaceZero(id));
+thrust::transform(thrust::device, eq_dEb_V, eq_dEb_V + n, eq_dEb_V, ReplaceZero(id));
 ```
 
 #### 输出
 
-- `ebIsZero_U_data`, `ebIsZero_U_indices`, `zero_eb_U_count`。
-- `ebisZero_V_data`, `ebIsZero_V_indices`, `zero_eb_V_count`。
-- 已把 `<= threshold` 的浮点 EB 和 ID 0 替换掉的 `dEb_U/V`、
-  `eq_dEb_U/V`。
+- `ebIsZero_U_data`, `ebIsZero_U_indices`, `zero_eb_U_count`，`ebisZero_V_data`, `ebIsZero_V_indices`, `zero_eb_V_count`，分别exceptionEB的U/V的数据，U/V的索引，U/V的个数。
+- 已把 `<= threshold` 的浮点 EB 和 量化EB 替换掉的 `dEb_U/V`、`eq_dEb_U/V`。
 
-zero-EB 列表不会送入 Huffman；它们作为 `(index, original_value)` 旁路数组
-直接写入文件。解压时在 Lorenzo 完成后通过 `thrust::scatter` 覆盖回去，见
-[`zero-EB 恢复`](./cpszg_2d_no_opt_speed.cu#L1287)。
+zero-EB 列表不会送入 Huffman；它们作为 `(index, original_value)` 旁路数组直接写入文件。解压时在 Lorenzo 完成后通过 `thrust::scatter` 覆盖回去，见[`zero-EB 恢复`](./cpszg_2d_no_opt_speed.cu#L1287)。
 
 #### Naive 性能特征
 
-这一段至少包含 9 次顶层全数组操作：1 次 `sequence`、4 次 `copy_if` 和 4 次
-`transform`。其中每次 `copy_if` 内部还可能包含不止一个 GPU kernel，因此
-它通常是 Naive 版本明显的内存流量和 kernel-launch 开销来源。
+这一段至少包含 9 次顶层全数组操作：1 次 `sequence`、4 次 `copy_if` 和 4 次`transform`。其中每次 `copy_if` 内部还可能包含不止一个 GPU kernel，因此它通常是 Naive 版本明显的内存流量和 kernel-launch 开销来源。
 
 ## 3. lorenzo
 
@@ -344,8 +367,7 @@ kernel 位置：
 launch wrapper：
 [`GPU_PROTO_c_lorenzo_row1d__eb_list`](../cusz/detail/lproto_c.cuhip.inl#L684)。
 
-虽然输入是二维数组，这个 Naive 主路径实际使用的是**逐行一维 Lorenzo**：
-各行之间并行，一行内部从左到右串行，预测器只使用左边已经重建的值。
+虽然输入是二维数组，这个 Naive 主路径实际使用的是**逐行一维 Lorenzo**：各行之间并行，一行内部从左到右串行，预测器只使用左边已经重建的值。
 
 ### 输入
 
@@ -391,9 +413,7 @@ if (qdiff < 2 * radius) {
 }
 ```
 
-预测状态使用 `decomp` 而不是 `cur`，保证压缩端和解压端使用完全相同的左邻
-值，避免误差沿一行失配。若量化码超出半径或重建误差检查失败，就保存为
-outlier：
+预测状态使用 `decomp` 而不是 `cur`，保证压缩端和解压端使用完全相同的左邻值，避免误差沿一行失配。若量化码超出半径或重建误差检查失败，就保存为outlier：
 
 ```cpp
 out_eq[id] = 0;
@@ -403,31 +423,24 @@ out_cval[idx] = in_data[id];
 prev = cur;
 ```
 
-例如 `pred = 10.0`、`cur = 10.25`、`eb = 0.1`，可得到 `qi = 513`，重建值
-为 `10.2`，误差为 `0.05 < 0.1`，因此在 `eq` 中保存 513，而不是保存原始
-浮点数。
+例如 `pred = 10.0`、`cur = 10.25`、`eb = 0.1`，可得到 `qi = 513`，重建值为 `10.2`，误差为 `0.05 < 0.1`，因此在 `eq` 中保存 513，而不是保存原始浮点数。
+详情请见paper：https://arxiv.org/abs/2007.09625
 
 主函数先压缩 U，再同步，然后压缩 V：
 
 ```cpp
-GPU_PROTO_c_lorenzo_row1d__eb_list(
-    dU, dim3(r2, r1, 1), eq_U,
-    ot_val_U, ot_idx_U, ot_num_U, dEb_U, RADIUS, &lrz_time, 0);
+GPU_PROTO_c_lorenzo_row1d__eb_list(dU, dim3(r2, r1, 1), eq_U, ot_val_U, ot_idx_U, ot_num_U, dEb_U, RADIUS, &lrz_time, 0);
 cudaDeviceSynchronize();
 
-GPU_PROTO_c_lorenzo_row1d__eb_list(
-    dV, dim3(r2, r1, 1), eq_V,
-    ot_val_V, ot_idx_V, ot_num_V, dEb_V, RADIUS, &lrz_time, 0);
+GPU_PROTO_c_lorenzo_row1d__eb_list(dV, dim3(r2, r1, 1), eq_V, ot_val_V, ot_idx_V, ot_num_V, dEb_V, RADIUS, &lrz_time, 0);
 ```
 
 ### 输出
 
-- `eq_U`, `eq_V`：长度都是 `n` 的 Lorenzo 量化码数组。
+- `eq_U`, `eq_V`：长度都是 `n` 的 Lorenzo 量化U/V码数组。
 - `ot_idx_U/V`, `ot_val_U/V`, `ot_num_U/V`：两个分量各自的 outlier 旁路。
 
-outlier 和 zero-EB 是不同集合。outlier 表示 Lorenzo 预测差无法安全编码；
-zero-EB 表示 derive 阶段给出的允许误差太小。解压时 outlier 必须在 Lorenzo
-之前预填充，zero-EB 必须在 Lorenzo 之后覆盖。
+outlier 和 zero-EB 是不同集合。outlier 表示 Lorenzo 预测差无法安全编码的U/V数据；zero-EB 表示 derive 阶段给出的允许误差太小的error bound。解压时 outlier 必须在 Lorenzo之前预填充，zero-EB 必须在 Lorenzo 之后覆盖。
 
 ### Naive 性能特征
 
@@ -449,17 +462,12 @@ Huffman 对下面 4 个长度均为 `n` 的符号数组分别编码：
 eq_U, eq_V, eq_dEb_U, eq_dEb_V
 ```
 
-通常 `eq_U/V` 是 `uint16_t`，`eq_dEb_U/V` 是 `uint8_t`，所以主函数调用
-`run_gpu_huffman_u2_u1_arrays`：
+通常 `eq_U/V` 是 `uint16_t`，`eq_dEb_U/V` 是 `uint8_t`，所以主函数调用`run_gpu_huffman_u2_u1_arrays`：
 
 ```cpp
-run_gpu_huffman_u2_u1_arrays(
-    reinterpret_cast<uint16_t*>(eq_U),
-    reinterpret_cast<uint16_t*>(eq_V),
-    reinterpret_cast<uint8_t*>(eq_dEb_U),
-    reinterpret_cast<uint8_t*>(eq_dEb_V),
-    num_elements, stream,
-    hf_lens, hf_encode_ms, hf_decode_ms, hf_blobs);
+run_gpu_huffman_u2_u1_arrays(reinterpret_cast<uint16_t*>(eq_U), reinterpret_cast<uint16_t*>(eq_V), 
+    reinterpret_cast<uint8_t*>(eq_dEb_U), reinterpret_cast<uint8_t*>(eq_dEb_V),
+    num_elements, stream, hf_lens, hf_encode_ms, hf_decode_ms, hf_blobs);
 ```
 
 ### 单个数组的处理过程
@@ -482,9 +490,7 @@ phf::high_level<uint8_t>::encode(
     &encoded, &encoded_len, hf_header, stream);
 ```
 
-步骤为：GPU 统计直方图，直方图复制到 CPU，构造 Huffman codebook，再在 GPU
-上编码。`h_hist[0] = 1` 是对单一符号 Huffman 树会产生空 bitstream 的规避。
-编码后的 blob 会复制到 host，因为同一个 `hf_buf` 随后会被下一数组重用。
+步骤为：GPU 统计直方图，直方图复制到 CPU，构造 Huffman codebook，再在 GPU上编码。`h_hist[0] = 1` 是对单一符号 Huffman 树会产生空 bitstream 的规避。编码后的 blob 会复制到 host，因为同一个 `hf_buf` 随后会被下一数组重用。
 
 4 个数组当前顺序调用，不是同时编码：
 
