@@ -1,16 +1,15 @@
-# V1.1 Bitmask 验证、构建与性能结论
 
-### V1.1 的版本定位
+# V1.1 构建、运行与优化结论
 
-V1.1 的首要目的不是在当前实现中立即超过 V1.0 的速度或压缩率，而是先验证 zero-EB bitmask 路径的正确性，并建立后续融合 kernel 和压缩率优化所需的确定性数据表示。本版本重点验证以下链路：
+初始测试日期：2026-08-24；当前代码复测日期：2026-09-02
 
-- bitmask 中的每个 bit 能否准确表示对应网格位置是否为 zero-EB；
-- bitmask、前缀和与按行主序排列的 zero-EB value side stream 能否一一对应；
-- bitmask 写入文件、读回和解压回填后，是否仍能保持 U/V 位级一致和临界点不变。
+> **2026-09-02 更新：** 当前代码使用 `RADIUS=512` 和
+> `LORENZO_TILE_DIM=16`。本次按新的统一条件重新编译 V1.0/V1.1，
+> 每版正式运行 100 次并比较程序打印的 `COMPRESS_TIME` 算术平均值。
+> 本节结果优先于后面的历史 5 次测试；两批测试的代码、tile/radius 和
+> 统计方法不同，不能混用。
 
-为了先获得一条容易核对的参考路径，V1.1 当前采用“fused kernel 生成 flag/bitmask → U/V 各一次 `exclusive_scan` → U/V 各一次 compact kernel”的实现（[调用链](cpszg_2d_v1.1.cu#L978-L1006)）。这一实现刻意优先保证 bitmask 语义和 side stream 顺序正确，它是后续优化的正确性基线，而不是最终的高性能紧凑实现。
-
-后续工作可在不改变已验证文件语义的前提下，将 flag 生成、块内排名和 value compact 融合，减少当前两次全长前缀和与两次额外全数组遍历。同时，已验证的 bitmask 格式为后续对位置模式做无损压缩，或在稀疏 index 与压缩 bitmask 之间自适应选择，提供了稳定输入。
+## 2026-09-02 当前代码 100 次复测
 
 ### 测试条件与方法
 
@@ -71,102 +70,22 @@ V1.1：0.77269 ms
 V1.1 用时是 V1.0 的 3.551x
 ```
 
-V1.0 的融合 kernel 在一次扫描中通过 `atomicAdd` 直接获得紧凑输出位置，并写出 zero-EB 的 value 和 index（[源码](../V1/fused_ebzero_kernel.cuh#L27-L44)）。它在 fused kernel 返回时已经完成 zero-EB side stream 的紧凑化，但由于原子加的执行顺序不固定，输出顺序也不是确定的行主序。
+V1.0 的融合 kernel 在一次扫描中直接把 zero-EB 的值和下标紧凑写出。V1.1 为了
+生成确定的 bitmask/有序 side stream，在融合 kernel 后增加两次长度为 `n` 的
+`thrust::exclusive_scan`，随后再运行 U/V 两个 compact kernel。因此 V1.1 的
+`eb_zero` 虽然仍是融合流程的一部分，但计时区间包含更多全数组操作。
 
-V1.1 的目标是验证确定的 bitmask 和有序 value side stream。它在 fused kernel 中生成逐元素 flag、bitmask 和 count，然后对 U/V 的 `n` 个 flag 各执行一次 `thrust::exclusive_scan`，最后再启动 U/V 两个 compact kernel（[调用链](cpszg_2d_v1.1.cu#L978-L1006)，[compact kernel](cpszg_2d_v1.1.cu#L412-L425)）。前缀和为每个 zero-EB 位置生成确定的行主序 rank，compact kernel 再按该 rank 写入 value。因此，V1.1 当前的 `eb_zero` 计时不仅包含融合 kernel，还包含两次全长前缀和与两次额外全数组遍历。
+V1.1 在 derive、uniform、Lorenzo、Huffman 和 tile pack 上合计挽回约
+0.24519 ms，扣除 land 增加的 0.00502 ms 后，其他阶段净挽回约 0.24017 ms；
+仍不足以抵消 `eb_zero` 增加的 0.55512 ms，最终 total 净增 0.31487 ms。
+阶段均值之和与 total 相差约 0.00008 ms，来自日志只打印三位小数。
 
-这一源码路径差异直接对应到测量结果：V1.1 的 `eb_zero` 由 `0.21757 ms` 增加到 `0.77269 ms`，净增 `0.55512 ms`，且 100 个配对中都是 V1.0 更快。这说明退化方向与新增全数组操作一致，是当前参考实现的稳定成本，而不是偶然的均值波动。
-
-除 `eb_zero` 外，两版在其余计时阶段走的是同一类计算路径：`derive_eb` 调用同一个 `derive_eb_offline_v2`，`land_data` 执行相同的逐点处理，`uniform_eb` 使用相同的 tile 最小 EB kernel，Lorenzo 使用同一套二维 tile 接口，Huffman 链接同一个 `factz_v1_huffman`，Tile-EB 也使用相同的 pack kernel（[V1.0 调用段](../V1/cpszg_2d_v1.cu#L880-L1039)，[V1.1 对应调用段](cpszg_2d_v1.1.cu#L940-L1112)，[共用 Huffman 目标](../CMakeLists.txt#L52-L68)）。这些阶段没有像 zero-EB 路径那样新增或删除全数组扫描，因此其均值差异没有对应的源码机制可以认定为优化。尤其 `derive_eb` 是每个新进程中的第一个主要计时 kernel，容易同时受到首次启动、GPU 频率和调度状态影响；Tile-EB 的绝对耗时很小，相对百分比也容易被放大。
-
-数据与这一判断一致：V1.1 在 `derive_eb`、`uniform_eb`、Lorenzo、Huffman 和 Tile-EB 上测得的负差值合计为 `0.24519 ms`，再扣除 `land_data` 增加的 `0.00502 ms`，表面上的其他阶段净抵消量为 `0.24017 ms`。这个数字只表示本轮样本均值对 total 的抵消量，不表示这些相同路径获得了确定的算法加速。它仍不足以抵消 `eb_zero` 增加的 `0.55512 ms`，所以 total 最终净增 `0.31487 ms`。按日志中已四舍五入的三位小数阶段值直接求和，会与 total 相差约 `0.00008 ms`。
-
-从样本分布看，V1.0/V1.1 的 total 样本标准差分别为 `0.66827/0.88938 ms`，范围分别为 `6.825–10.995 ms` 和 `7.101–13.845 ms`；100 个配对中，V1.0 total 较短 69 次，V1.1 较短 31 次，说明总时间仍叠加了运行波动。`eb_zero` 则在 `100/100` 个配对中均为 V1.0 更快，并且退化方向与新增全数组操作一致。因此，本轮结果能明确归因的是 zero-EB 参考路径的额外工作，而不是把其余阶段约 `1%–2.5%` 的小幅均值变化，或 Tile-EB 在极小基数上的相对变化，解释成新的算法优化。
-
-#### 对应代码
-
-V1.0：在一个 fused kernel 中通过 `atomicAdd` 得到紧凑输出位置，直接写出
-`value + index`（[查看源码](../V1/fused_ebzero_kernel.cuh#L27-L44)）：
-
-```cpp
-const size_t i =
-    static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-if (i >= n) return;
-
-if (eq_eb_U[i] == Eq{0}) {
-    const uint32_t out = atomicAdd(zero_U_count, 1u);
-    zero_U_values[out] = data_U[i];
-    zero_U_indices[out] = static_cast<uint32_t>(i);
-    eq_eb_U[i] = replacement_id;
-}
-if (eb_U[i] <= threshold) eb_U[i] = replacement_eb;
-
-if (eq_eb_V[i] == Eq{0}) {
-    const uint32_t out = atomicAdd(zero_V_count, 1u);
-    zero_V_values[out] = data_V[i];
-    zero_V_indices[out] = static_cast<uint32_t>(i);
-    eq_eb_V[i] = replacement_id;
-}
-if (eb_V[i] <= threshold) eb_V[i] = replacement_eb;
-```
-
-V1.1 第一步：fused kernel 生成逐元素 flag、bitmask 和 count
-（[查看源码](fused_ebzero_kernel.cuh#L25-L45)）：
-
-```cpp
-const size_t i =
-    static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-if (i >= n) return;
-
-const bool zero_u = eq_eb_U[i] == Eq{0};
-const bool zero_v = eq_eb_V[i] == Eq{0};
-zero_U_flags[i] = zero_u;
-zero_V_flags[i] = zero_v;
-
-if (zero_u) {
-    atomicOr(zero_U_mask + (i >> 5), 1u << (i & 31u));
-    atomicAdd(zero_U_count, 1u);
-    eq_eb_U[i] = replacement_id;
-}
-if (eb_U[i] <= threshold) eb_U[i] = replacement_eb;
-
-if (zero_v) {
-    atomicOr(zero_V_mask + (i >> 5), 1u << (i & 31u));
-    atomicAdd(zero_V_count, 1u);
-    eq_eb_V[i] = replacement_id;
-}
-if (eb_V[i] <= threshold) eb_V[i] = replacement_eb;
-```
-
-V1.1 第二步：对 U/V 的 `n` 个 flags 分别执行前缀和，再分别启动 compact
-kernel（[查看调用点](cpszg_2d_v1.1.cu#L995-L1006)）：
-
-```cpp
-thrust::exclusive_scan(thrust::device,
-    ebIsZero_U_indices, ebIsZero_U_indices + num_elements,
-    ebIsZero_U_indices);
-thrust::exclusive_scan(thrust::device,
-    ebIsZero_V_indices, ebIsZero_V_indices + num_elements,
-    ebIsZero_V_indices);
-
-kernel_compact_zeroeb_values<T><<<zeb_grid, ZEB_BLK>>>(
-    dU, d_zeroeb_mask_U, ebIsZero_U_indices,
-    ebIsZero_U_data, num_elements);
-kernel_compact_zeroeb_values<T><<<zeb_grid, ZEB_BLK>>>(
-    dV, d_zeroeb_mask_V, ebIsZero_V_indices,
-    ebisZero_V_data, num_elements);
-```
-
-V1.1 的 compact kernel 再遍历一次完整数组，用 mask 判断当前元素是否入选，用
-前缀和结果决定紧凑输出位置（[查看源码](cpszg_2d_v1.1.cu#L412-L425)）：
-
-```cpp
-size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-if (i >= n) return;
-if ((mask[i >> 5] >> (i & 31u)) & 1u) {
-    zeroeb_values[offsets[i]] = data[i];
-}
-```
+除 `eb_zero` 外的差异都很小，而且 derive 是每个新进程中的第一个主要计时
+kernel，波动较大。V1.0/V1.1 的 total 样本标准差分别为 0.66827/0.88938 ms，
+范围分别为 6.825–10.995 ms 和 7.101–13.845 ms。100 个配对中 V1.0 总时间
+较短 69 次，V1.1 较短 31 次；但是 `eb_zero` 在 100/100 个配对中均为 V1.0
+更快。因此不能把约 1%–2.5% 的其他阶段均值差异单独解释成确定的算法优化，
+而 zero-EB 的退化方向和源码变化是一致且稳定的。
 
 ### 正确性与压缩文件
 
@@ -187,16 +106,95 @@ if ((mask[i >> 5] >> (i & 31u)) & 1u) {
 | U outlier / zero-EB  | 719,663 / 123,344 | 719,663 / 123,344 |                    相同 |
 | V outlier / zero-EB  | 788,103 / 123,345 | 788,103 / 123,345 |                    相同 |
 
-当前 V1.1 直接保存两个未压缩的完整 bitmask，每个分量均占 `8,640,000 / 8 = 1,080,000 bytes`。V1.0 对 zero-EB 位置保存逐项 `uint32_t` index，两个分量合计为：
+### 结果文件
 
-```text
-(123,344 + 123,345) * 4 = 986,756 bytes
+- 中文摘要：`benchmark_v1_v11_100runs_20260902T223532Z/RESULT_ZH.md`
+- 每次正式运行：`benchmark_v1_v11_100runs_20260902T223532Z/measured_results.csv`
+- 每版平均值：`benchmark_v1_v11_100runs_20260902T223532Z/averages.csv`
+- 版本差值：`benchmark_v1_v11_100runs_20260902T223532Z/comparison.csv`
+- 完整日志：`benchmark_v1_v11_100runs_20260902T223532Z/logs/`
+
+## 2026-08-24 历史测试说明
+
+以下内容保留原报告的 5 次测试、profiling 和论文对应关系。它记录的是当时的
+代码与测试条件，不能用来替换上面的当前 100 次平均结果。
+
+## 测试环境
+
+- GPU: NVIDIA GeForce RTX 3080, compute capability 8.6
+- CUDA: nvcc 12.6.85
+- Nsight Compute: 2025.1.0
+- 数据: Ocean `uf.dat/vf.dat`, `2400 x 3600`, 共 8,640,000 个二维向量
+- 参数: `max_relative_eb=0.1`
+- 构建类型: Release, `CMAKE_CUDA_ARCHITECTURES=86`
+- 计时边界: 程序输出的 CUDA kernel 阶段之和，不包含文件 I/O 和 Huffman CPU 建树时间
+- 论文: `/home/boyi/FaCTz/ppopp27-summer-paper854.pdf`
+
+主 `.cu` 与 `FaCTz/experiments/cuda/cpszg_2d_v1.1.cu` 的 SHA-256 一致。原 experiments 目录没有保留该阶段的 `fused_ebzero_kernel.cuh`，本目录中的 helper 是根据 V1.1 调用参数和 bitmask/scan 数据流重建的兼容实现。
+
+## 构建和运行
+
+```bash
+make -C src/cuda/V1.1
+make -C src/cuda/V1.1 run
+make -C src/cuda/V1.1 clean
 ```
 
-因此，未压缩 bitmask 相对稀疏 index 恰好增加：
+Make target 和 CMake target 均为 `cpszg_2d_v1_1`。独立 Make 构建、全新 CMake 全版本构建和实际运行均成功。
 
-```text
-2 * 1,080,000 - 986,756 = 1,173,244 bytes
-```
+## 正确性
 
-这与表中完整文件的增量完全一致。所以，当前文件变大不是 bitmask 验证失败，而是 V1.1 暂时将未压缩完整 bitmask 作为参考格式的可量化代价。本版本已完成的是 bitmask 位置语义、有序 value side stream 和文件回填链路的正确性验证；性能与压缩率收益需由后续 fused kernel、bitmask 无损压缩或稀疏/稠密表示自适应选择来实现。
+V1.1 自带的内存解压与文件解压结果对 U/V 都是 bit-identical。统一 verifier 的结果为：
+
+| 指标                              |               结果 |
+| --------------------------------- | -----------------: |
+| 原始/解压 critical points         |    20,929 / 20,929 |
+| matched / FP / FN / type mismatch | 20,929 / 0 / 0 / 0 |
+| U 最大绝对误差                    |       0.0624847412 |
+| V 最大绝对误差                    |       0.0622329712 |
+| overall max relative EB           |    1.8089997539e-4 |
+
+结论：V1.1 在该输入上保持全部 critical points，且与 V1 的恢复误差相同。
+
+## 性能
+
+先运行一次 warm-up，再独立运行 5 次。下面的 runs 已排序。
+
+| 版本 | 5 次 GPU compression total (ms)        |    中位数 | 相对上一版 |
+| ---- | -------------------------------------- | --------: | ---------: |
+| V1   | 12.418, 13.467, 14.082, 14.198, 31.961 | 14.082 ms |          - |
+| V1.1 | 12.194, 12.292, 12.484, 12.571, 12.608 | 12.484 ms |     1.128x |
+
+V1.1 阶段中位数：derive EB 2.811 ms、land 0.214 ms、zero-EB 0.797 ms、tile uniform 0.527 ms、Lorenzo 2.017 ms、Huffman 5.883 ms、tile payload pack 0.140 ms。
+
+V1.1 内置 GPU 解压的 5 次中位数为 3.875 ms；V1 为 3.781 ms，因此 V1.1 解压没有加速，约慢 2.5%。
+
+## 源码能够确认的变化
+
+1. zero-EB 位置由稀疏 `uint32_t` index 数组改成完整 bitmask。`kernel_compact_zeroeb_values` 根据 bitmask 和 exclusive-scan offset 按行优先顺序收集原值，解压时执行反向 restore。
+2. 压缩流程为 U/V 分别生成 bitmask、执行逐元素 Thrust scan，再执行两个 compact kernel。
+3. 文件中 zero-EB side stream 从 `index + value` 改为 `bitmask + value`。Ocean 上文件由 V1 的 27,006,658 bytes 增至 28,179,902 bytes，compression ratio 从 2.559 降至 2.453。
+4. derive-EB、tile uniform、Lorenzo 和旧 Huffman bridge 没有实质算法变化。因此 1.128x 总体差异主要来自本批次 derive-EB 波动，不能归因于 V1.1 新增 bitmask 逻辑。
+
+关键位置：`cpszg_2d_v1.1.cu:556`、`:1133`、`:1172`、`:1240`，以及 `fused_ebzero_kernel.cuh`。
+
+## Profiling 证据
+
+Nsight Compute `basic` 对新增的 zero-EB compact kernel 得到：
+
+| kernel    | duration | achieved occupancy | DRAM throughput | registers/thread |
+| --------- | -------: | -----------------: | --------------: | ---------------: |
+| compact U | 77.60 us |             56.93% |          14.53% |               16 |
+| compact V | 77.50 us |             56.94% |          15.65% |               16 |
+
+该 kernel 本身不重，但 V1.1 还需要两个长度为 `n` 的 scan。实测 zero-EB 阶段 0.797 ms，高于 V1 的 0.216 ms；bitmask 的主要价值是稳定、可逆的 side-stream 表达，而不是这一版的速度。
+
+## 与论文对应
+
+论文 Section 4.1 描述了 bitmask、population count、scan 和 ordered side stream。V1.1 只完成了这一思路的中间形态：它仍扫描两个长度为 `n` 的逐元素 offset 数组，而论文实现按 mask word 计数并扫描，后者在 V1.3 才出现。论文没有给出 V1.1 这样的版本编号，因此不能把论文最终性能直接归到该中间版本。
+
+## 限制
+
+- 单一 Ocean 数据集和单一误差参数，不代表其他尺寸或 zero-EB 密度。
+- V1 的 5 次结果有一次 31.961 ms 离群值，因此使用中位数；V1.1 的代码变化本身不支持“derive EB 被优化”的结论。
+- NCU replay 会显著放大程序内计时，报告只使用 NCU 的 per-kernel 指标，不使用 profiling run 的总时间。
