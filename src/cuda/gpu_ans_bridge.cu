@@ -25,7 +25,7 @@ namespace {
 #define CPSZ_ANS_CHUNK_BYTES (64 * 1024)
 #endif
 constexpr size_t kAnsChunkBytes = CPSZ_ANS_CHUNK_BYTES;
-constexpr uint16_t kQuantRadius = 4096;
+constexpr uint16_t kQuantRadius = 1024;
 constexpr char kAnsU16LegacyMagic[8] = {'C', 'P', 'A', 'N', 'S', 'U', '2', '\0'};
 constexpr char kAnsU16ZigzagMagic[8] = {'C', 'P', 'A', 'N', 'S', 'Z', '2', '\0'};
 

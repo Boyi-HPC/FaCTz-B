@@ -673,7 +673,7 @@ extern "C" void run_gpu_huffman_u2_arrays_timed(
     size_t out_lens[2], float out_encode_ms[2], float out_decode_ms[2],
     uint8_t* out_h_blobs[2], float* out_parallel_wall_ms, float* out_kernel_ms)
 {
-    constexpr uint16_t bklen = 8192;
+    constexpr uint16_t bklen = 1024;
     auto stream_U = reinterpret_cast<cudaStream_t>(stream);
     cudaStream_t stream_V;
     cudaStreamCreateWithFlags(&stream_V, cudaStreamNonBlocking);
